@@ -6,7 +6,7 @@ import {PWAInstallButton} from './PWAInstallButton';
 export type UserRole = 'ASHA' | 'DMO' | null;
 export type CurrentView = 'LOGIN' | 'ASHA_MOBILE' | 'DMO_DASHBOARD';
 export type AshaNavTab = 'checkup' | 'records' | 'assistant' | 'activity';
-export type DmoNavTab = 'overview' | 'urgent' | 'records' | 'sms';
+export type DmoNavTab = 'overview' | 'urgent' | 'records' | 'workers' | 'sms';
 
 interface TopRoleToolbarProps {
   isAuthenticated: boolean;
@@ -139,6 +139,17 @@ export const TopRoleToolbar: React.FC<TopRoleToolbarProps> = ({
                   }`}
                 >
                   Patient Records
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onSelectDmoTab('workers')}
+                  className={`py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    dmoTab === 'workers'
+                      ? 'text-teal-700 font-semibold underline underline-offset-8 decoration-2'
+                      : 'hover:text-slate-900'
+                  }`}
+                >
+                  Health Workers
                 </button>
                 <button
                   type="button"

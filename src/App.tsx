@@ -1,12 +1,19 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {IncentiveEntry, NetworkState, TriageRecord} from './types/triage';
 import {
+  AshaWorkerRosterEntry,
+  broadcastLocalRealtimeEvent,
   buildUserVaultScope,
   HealthSyncRealtimeClient,
+  loadEncryptedDistrictRelay,
   loadEncryptedRecords,
   persistEncryptedRecords,
   purgeLegacyPlaintextStorage,
   RealtimeEventMessage,
+  removeRecordFromDistrictRelay,
+  setWorkerVerifiedInDistrictRelay,
+  upsertRecordsInDistrictRelay,
+  upsertWorkerInDistrictRelay,
 } from './utils/realtimeSync';
 import {persistActiveAuthToken} from './utils/clinicalSummaryClient';
 import {safeReadJson} from './utils/safeFetchJson';
@@ -90,8 +97,9 @@ export function App() {
     typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : '4g'
   );
 
-  // Real Triage Records & Visit Stipend Log (zero fabricated mock records)
+  // Real Triage Records, Connected ASHA Roster & Visit Stipend Log (zero fabricated mock records)
   const [records, setRecords] = useState<TriageRecord[]>([]);
+  const [ashaWorkers, setAshaWorkers] = useState<AshaWorkerRosterEntry[]>([]);
   const [incentives, setIncentives] = useState<IncentiveEntry[]>([]);
   const [isLoadingRecords, setIsLoadingRecords] = useState<boolean>(false);
 
@@ -193,11 +201,7 @@ export function App() {
 
   // Authenticated WebSocket + BroadcastChannel Real-Time Transport
   useEffect(() => {
-    if (
-      !isAuthenticated ||
-      !sessionToken ||
-      (userRole === 'ASHA' && authUser?.isVerified === false)
-    ) {
+    if (!isAuthenticated || !sessionToken) {
       realtimeRef.current?.destroy();
       realtimeRef.current = null;
       return;
@@ -214,6 +218,7 @@ export function App() {
     const handleRealtimeMessage = (msg: RealtimeEventMessage) => {
       if (msg.type === 'sync:init' && Array.isArray(msg.records)) {
         const allowedRecords = msg.records.filter(canCurrentUserAccessRecord);
+        void upsertRecordsInDistrictRelay(allowedRecords);
         setRecords((prev) => mergeRecordsById(allowedRecords, prev));
         if (networkStateRef.current !== 'offline') {
           flushOfflineQueue();
@@ -221,6 +226,7 @@ export function App() {
       } else if (msg.type === 'record:created') {
         if (!canCurrentUserAccessRecord(msg.record)) return;
         const alreadyKnown = recordsRef.current.some((r) => r.id === msg.record.id);
+        void upsertRecordsInDistrictRelay([msg.record]);
         setRecords((prev) => {
           if (prev.some((r) => r.id === msg.record.id)) return prev;
           return [msg.record, ...prev];
@@ -237,6 +243,7 @@ export function App() {
           }
         }
       } else if (msg.type === 'record:updated') {
+        void upsertRecordsInDistrictRelay([msg.record]);
         setRecords((prev) => {
           if (!prev.some((r) => r.id === msg.record.id) && userRoleRef.current !== 'DMO') {
             return prev;
@@ -244,21 +251,40 @@ export function App() {
           return prev.map((r) => (r.id === msg.record.id ? msg.record : r));
         });
       } else if (msg.type === 'record:deleted') {
+        void removeRecordFromDistrictRelay(msg.recordId);
         setRecords((prev) => prev.filter((r) => r.id !== msg.recordId));
+      } else if (msg.type === 'asha:roster_updated') {
+        const updatedWorker = msg.worker;
+        if (updatedWorker?.identifier) {
+          setAshaWorkers((prev) => [
+            updatedWorker,
+            ...(prev || []).filter(
+              (w) => w.identifier.toUpperCase() !== updatedWorker.identifier.toUpperCase()
+            ),
+          ]);
+          if (
+            userRoleRef.current === 'ASHA' &&
+            authIdentifierRef.current.trim().toUpperCase() ===
+              updatedWorker.identifier.trim().toUpperCase() &&
+            updatedWorker.isVerified
+          ) {
+            isAshaVerifiedRef.current = true;
+            setAuthUser((prev) => (prev ? {...prev, isVerified: true} : prev));
+            flushOfflineQueue();
+          }
+        }
       } else if (msg.type === 'sync:ack') {
+        const ackedRecord: TriageRecord = {
+          ...msg.record,
+          syncStatus:
+            msg.record.channel === 'Emergency SMS'
+              ? ('SMS Delivered' as const)
+              : ('Synced' as const),
+        };
+        void upsertRecordsInDistrictRelay([ackedRecord]);
         setRecords((prev) => {
           if (!prev.some((r) => r.id === msg.recordId)) return prev;
-          return prev.map((r) =>
-            r.id === msg.recordId
-              ? {
-                  ...msg.record,
-                  syncStatus:
-                    msg.record.channel === 'Emergency SMS'
-                      ? ('SMS Delivered' as const)
-                      : ('Synced' as const),
-                }
-              : r
-          );
+          return prev.map((r) => (r.id === msg.recordId ? ackedRecord : r));
         });
       } else if (msg.type === 'sync:error') {
         if (!msg.recordId) return;
@@ -277,7 +303,15 @@ export function App() {
       }
     };
 
-    const client = new HealthSyncRealtimeClient(sessionToken, handleRealtimeMessage);
+    // For unverified online ASHA accounts, attach BroadcastChannel without opening /ws/triage until verified
+    const effectiveWsToken =
+      userRole === 'ASHA' && authUser?.isVerified === false
+        ? 'OFFLINE_LOCAL_SESSION'
+        : sessionToken;
+    const client = new HealthSyncRealtimeClient(effectiveWsToken, handleRealtimeMessage);
+    if (sessionToken && sessionToken !== 'OFFLINE_LOCAL_SESSION' && authUser?.isVerified !== false) {
+      client.updateSessionToken(sessionToken);
+    }
     realtimeRef.current = client;
 
     return () => {
@@ -285,6 +319,103 @@ export function App() {
       realtimeRef.current = null;
     };
   }, [isAuthenticated, sessionToken, userRole, authUser?.isVerified, flushOfflineQueue]);
+
+  // Live verification & relay refresh for pending ASHA workers and active DMO officers
+  useEffect(() => {
+    if (!isAuthenticated || !authUser) return;
+
+    const refreshFromDistrictRelayAndServer = async () => {
+      try {
+        const relay = await loadEncryptedDistrictRelay();
+        if (userRole === 'DMO') {
+          if (Array.isArray(relay.workers)) {
+            setAshaWorkers((prev) => {
+              const byId = new Map<string, AshaWorkerRosterEntry>();
+              for (const w of prev || []) byId.set(w.identifier.toUpperCase(), w);
+              for (const w of relay.workers) {
+                const k = w.identifier.toUpperCase();
+                const old = byId.get(k);
+                byId.set(k, {
+                  ...w,
+                  isVerified: Boolean(w.isVerified || old?.isVerified),
+                });
+              }
+              return Array.from(byId.values());
+            });
+          }
+          if (Array.isArray(relay.records) && relay.records.length > 0) {
+            setRecords((prev) => mergeRecordsById(prev, relay.records));
+          }
+          if (networkState !== 'offline' && sessionToken && sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+            const resp = await fetch('/api/records', {
+              headers: {Authorization: `Bearer ${sessionToken}`},
+            });
+            if (resp.ok) {
+              const parsed = await safeReadJson<{records?: TriageRecord[]}>(resp);
+              if (parsed.isJson && Array.isArray(parsed.data?.records)) {
+                void upsertRecordsInDistrictRelay(parsed.data.records);
+                setRecords((prev) => mergeRecordsById(parsed.data!.records!, prev));
+              }
+            }
+          }
+        } else if (userRole === 'ASHA') {
+          const normId = authUser.identifier.trim().toUpperCase();
+          const relayMe = relay.workers.find((w) => w.identifier.toUpperCase() === normId);
+          if (relayMe?.isVerified && authUser.isVerified === false) {
+            isAshaVerifiedRef.current = true;
+            setAuthUser((prev) => (prev ? {...prev, isVerified: true} : prev));
+            flushOfflineQueue();
+          }
+          // Sync any DMO ambulance dispatch updates back into this ASHA worker's records
+          const myRelayRecords = (relay.records || []).filter((r) =>
+            String(r?.ashaWorker || '').toUpperCase().includes(`(${normId})`)
+          );
+          if (myRelayRecords.length > 0) {
+            setRecords((prev) => mergeRecordsById(myRelayRecords, prev));
+          }
+          if (
+            authUser.isVerified === false &&
+            networkState !== 'offline' &&
+            sessionToken &&
+            sessionToken !== 'OFFLINE_LOCAL_SESSION'
+          ) {
+            const meRes = await fetch('/api/auth/me', {
+              headers: {Authorization: `Bearer ${sessionToken}`},
+            });
+            if (meRes.ok) {
+              const meParsed = await safeReadJson<{user?: {isVerified?: boolean}}>(meRes);
+              if (meParsed.isJson && meParsed.data?.user?.isVerified) {
+                isAshaVerifiedRef.current = true;
+                setAuthUser((prev) => (prev ? {...prev, isVerified: true} : prev));
+                void setWorkerVerifiedInDistrictRelay(normId, true, 'DMO_SERVER');
+                flushOfflineQueue();
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore transient polling errors
+      }
+    };
+
+    const pollInterval = window.setInterval(() => {
+      void refreshFromDistrictRelayAndServer();
+    }, 8_000);
+
+    const handleVisibilityFocus = () => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void refreshFromDistrictRelayAndServer();
+      }
+    };
+    window.addEventListener('focus', handleVisibilityFocus);
+    document.addEventListener('visibilitychange', handleVisibilityFocus);
+
+    return () => {
+      window.clearInterval(pollInterval);
+      window.removeEventListener('focus', handleVisibilityFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityFocus);
+    };
+  }, [isAuthenticated, authUser, userRole, networkState, sessionToken, flushOfflineQueue]);
 
   // Periodic shift session token rotation (every 30 minutes while online)
   useEffect(() => {
@@ -348,12 +479,58 @@ export function App() {
     setIsLoadingRecords(true);
 
     try {
-      // 1. Decrypt THIS user's isolated local AES-256-GCM offline vault
-      const localDecrypted = await loadEncryptedRecords(session.vaultKey, [], userScope);
+      // 1. Decrypt THIS user's isolated local AES-256-GCM offline vault + District Relay bridge
+      const [localDecrypted, districtRelay] = await Promise.all([
+        loadEncryptedRecords(session.vaultKey, [], userScope),
+        loadEncryptedDistrictRelay(),
+      ]);
+
+      let effectiveVerified = session.user.isVerified;
+      let initialRecords = [...localDecrypted];
+
+      if (session.user.role === 'ASHA') {
+        const normId = session.user.identifier.trim().toUpperCase();
+        const relayEntry = districtRelay.workers.find(
+          (w) => w.identifier.toUpperCase() === normId
+        );
+        if (relayEntry?.isVerified && effectiveVerified === false) {
+          effectiveVerified = true;
+          isAshaVerifiedRef.current = true;
+          setAuthUser((prev) => (prev ? {...prev, isVerified: true} : prev));
+        }
+        const registeredEntry = await upsertWorkerInDistrictRelay({
+          identifier: normId,
+          displayName: session.user.displayName,
+          villageCode: session.user.villageCode,
+          isVerified: effectiveVerified !== false,
+        });
+        if (registeredEntry) {
+          broadcastLocalRealtimeEvent({
+            type: 'asha:roster_updated',
+            worker: registeredEntry,
+          });
+        }
+        // Merge any DMO dispatch updates for this ASHA worker's records from the Encrypted District Relay
+        const myRelayRecords = (districtRelay.records || []).filter((r) =>
+          String(r?.ashaWorker || '').toUpperCase().includes(`(${normId})`)
+        );
+        if (myRelayRecords.length > 0) {
+          initialRecords = mergeRecordsById(myRelayRecords, initialRecords);
+        }
+        if (initialRecords.length > 0) {
+          void upsertRecordsInDistrictRelay(initialRecords);
+        }
+      } else if (session.user.role === 'DMO') {
+        setAshaWorkers(districtRelay.workers || []);
+        if (Array.isArray(districtRelay.records) && districtRelay.records.length > 0) {
+          initialRecords = mergeRecordsById(initialRecords, districtRelay.records);
+        }
+      }
+
       isVaultHydratedRef.current = true;
-      setRecords([...localDecrypted]);
+      setRecords(initialRecords);
       const localDerivedIncentives =
-        session.user.role === 'ASHA' ? localDecrypted.map(buildIncentiveForRecord) : [];
+        session.user.role === 'ASHA' ? initialRecords.map(buildIncentiveForRecord) : [];
       if (localDerivedIncentives.length > 0) {
         setIncentives(localDerivedIncentives);
       }
@@ -362,7 +539,7 @@ export function App() {
       if (
         networkState !== 'offline' &&
         session.token !== 'OFFLINE_LOCAL_SESSION' &&
-        (session.user.role !== 'ASHA' || session.user.isVerified !== false)
+        (session.user.role !== 'ASHA' || effectiveVerified !== false)
       ) {
         const [recordsRes, incentivesRes] = await Promise.all([
           fetch('/api/records', {
@@ -383,7 +560,7 @@ export function App() {
           const parsedRecords = await safeReadJson<{records?: TriageRecord[]}>(recordsRes);
           const data = parsedRecords.isJson && parsedRecords.data ? parsedRecords.data : null;
           if (data && Array.isArray(data.records)) {
-            const unsynced = localDecrypted.filter((r) => r?.syncStatus === 'Queued Offline');
+            const unsynced = initialRecords.filter((r) => r?.syncStatus === 'Queued Offline');
             const confirmedSyncedById = new Map<string, TriageRecord>();
 
             for (const q of unsynced) {
@@ -421,6 +598,14 @@ export function App() {
                 );
               }
             }
+
+            const mergedAll = mergeRecordsById(
+              data.records || [],
+              initialRecords.map((r) =>
+                confirmedSyncedById.has(r.id) ? confirmedSyncedById.get(r.id)! : r
+              )
+            );
+            void upsertRecordsInDistrictRelay(mergedAll);
 
             // Pure functional state update merging against LIVE state (vault persistence runs via useEffect)
             setRecords((currentRecords) => {
@@ -462,6 +647,7 @@ export function App() {
     setSessionToken('');
     setAuthUser(null);
     setRecords([]);
+    setAshaWorkers([]);
     setIncentives([]);
     setIsAuthenticated(false);
     setUserRole(null);
@@ -489,16 +675,45 @@ export function App() {
   };
 
   const handleAshaVerified = (rotatedToken?: string) => {
-    setAuthUser((prev) => (prev ? {...prev, isVerified: true} : prev));
+    isAshaVerifiedRef.current = true;
+    setAuthUser((prev) => {
+      if (!prev) return prev;
+      void setWorkerVerifiedInDistrictRelay(
+        prev.identifier,
+        true,
+        'CLINIC_ENROLLMENT_CODE'
+      ).then((entry) => {
+        if (entry) {
+          broadcastLocalRealtimeEvent({
+            type: 'asha:roster_updated',
+            worker: entry,
+          });
+        }
+      });
+      return {...prev, isVerified: true};
+    });
     if (rotatedToken) {
       persistActiveAuthToken(rotatedToken);
       setSessionToken(rotatedToken);
+    }
+    // Also share any locally queued records into the District Relay once verified
+    if (recordsRef.current.length > 0) {
+      void upsertRecordsInDistrictRelay(recordsRef.current);
+      for (const rec of recordsRef.current) {
+        broadcastLocalRealtimeEvent({
+          type: 'record:created',
+          record: rec,
+          triggerEmergencySiren: rec.severity === 'emergency',
+        });
+      }
     }
     flushOfflineQueue();
   };
 
   const handleDeleteRecord = async (recordId: string) => {
     if (!sessionToken || userRole !== 'DMO') return;
+    await removeRecordFromDistrictRelay(recordId);
+    broadcastLocalRealtimeEvent({type: 'record:deleted', recordId});
     if (sessionToken === 'OFFLINE_LOCAL_SESSION') {
       setRecords((prev) => prev.filter((r) => r.id !== recordId));
       return;
@@ -512,11 +727,11 @@ export function App() {
         },
         body: JSON.stringify({reason: 'DPDP Section 8 authorized DMO erasure'}),
       });
-      if (resp.ok) {
+      if (resp.ok || resp.status === 404) {
         setRecords((prev) => prev.filter((r) => r.id !== recordId));
       }
     } catch {
-      // Ignore transient errors
+      setRecords((prev) => prev.filter((r) => r.id !== recordId));
     }
   };
 
@@ -525,6 +740,7 @@ export function App() {
 
     // Until the server confirms SQLite persistence via sync:ack, store records safely as 'Queued Offline'
     const safeLocalRecord: TriageRecord = {...newRecord, syncStatus: 'Queued Offline'};
+    const triggerSiren = isEmergencySms || newRecord.severity === 'emergency';
 
     setRecords((prev) => {
       if (prev.some((r) => r.id === safeLocalRecord.id)) return prev;
@@ -537,12 +753,21 @@ export function App() {
       return [newIncentive, ...prev];
     });
 
-    if (
-      networkState !== 'offline' &&
-      sessionToken !== 'OFFLINE_LOCAL_SESSION' &&
-      authUser?.isVerified !== false
-    ) {
-      const triggerSiren = isEmergencySms || newRecord.severity === 'emergency';
+    // Always persist verified ASHA checkups to Encrypted District Relay & BroadcastChannel
+    // so DMO officers on the same device or adjacent tabs receive referrals immediately!
+    if (authUser?.isVerified !== false) {
+      void upsertRecordsInDistrictRelay([safeLocalRecord]);
+      if (authUser?.role === 'ASHA') {
+        void upsertWorkerInDistrictRelay({
+          identifier: authUser.identifier,
+          displayName: authUser.displayName,
+          villageCode: authUser.villageCode,
+          isVerified: true,
+        });
+      }
+    }
+
+    if (networkState !== 'offline' && authUser?.isVerified !== false) {
       const serverPayload: TriageRecord = {
         ...newRecord,
         syncStatus: isEmergencySms ? 'SMS Delivered' : 'Synced',
@@ -566,12 +791,21 @@ export function App() {
           sirenEngine.playTestSirenBurst();
         }
       }
+    } else if (authUser?.isVerified !== false) {
+      // Offline mode on same device: notify any open DMO tab via BroadcastChannel
+      broadcastLocalRealtimeEvent({
+        type: 'record:created',
+        record: safeLocalRecord,
+        triggerEmergencySiren: triggerSiren,
+      });
     }
   };
 
   const handleDispatchAmbulance = (recordId: string) => {
     sirenEngine.stopSiren();
     setSirenActive(false);
+
+    const existingTarget = (recordsRef.current || []).find((r) => r?.id === recordId);
 
     setRecords((prev) =>
       (prev || []).map((rec) => {
@@ -586,7 +820,7 @@ export function App() {
     );
 
     void realtimeRef.current
-      ?.publishRecordDispatched(recordId, '108-AMB-UP65', 11)
+      ?.publishRecordDispatched(recordId, '108-AMB-UP65', 11, existingTarget)
       .catch((err) => {
         console.warn('[HealthSync Dispatch] Dispatch status queued locally:', err);
       });
@@ -666,6 +900,7 @@ export function App() {
             dmoDisplayName={authUser.displayName}
             sessionToken={sessionToken}
             records={records}
+            ashaWorkers={ashaWorkers}
             isLoadingRecords={isLoadingRecords}
             activeTab={dmoTab}
             onSelectTab={setDmoTab}
@@ -675,6 +910,14 @@ export function App() {
             onToggleMuteSiren={handleToggleMuteSiren}
             onDispatchAmbulance={handleDispatchAmbulance}
             onDeleteRecord={handleDeleteRecord}
+            onWorkerApproved={(approved) => {
+              setAshaWorkers((prev) => [
+                approved,
+                ...(prev || []).filter(
+                  (w) => w.identifier.toUpperCase() !== approved.identifier.toUpperCase()
+                ),
+              ]);
+            }}
           />
         ) : (
           <LoginPage networkState={networkState} onAuthenticated={handleAuthenticated} />

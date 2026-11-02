@@ -1089,6 +1089,46 @@ export class HealthSyncDatabase {
     }));
   }
 
+  public listAshaWorkers(): Array<{
+    id: string;
+    identifier: string;
+    displayName: string;
+    villageCode: string;
+    isVerified: boolean;
+    verifiedBy: string | null;
+    verifiedAtMs: number | null;
+    createdAtMs: number;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, identifier, display_name, village_code, is_verified, verified_by, verified_at_ms, created_at_ms
+         FROM users
+         WHERE role = 'ASHA'
+         ORDER BY is_verified ASC, created_at_ms DESC`
+      )
+      .all() as Array<{
+      id: string;
+      identifier: string;
+      display_name: string;
+      village_code: string;
+      is_verified: number;
+      verified_by: string | null;
+      verified_at_ms: number | null;
+      created_at_ms: number;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      identifier: r.identifier,
+      displayName: r.display_name,
+      villageCode: r.village_code,
+      isVerified: Boolean(r.is_verified),
+      verifiedBy: r.verified_by ?? null,
+      verifiedAtMs: r.verified_at_ms ?? null,
+      createdAtMs: r.created_at_ms,
+    }));
+  }
+
   private resolveSessionTtlMs(role: ServerUserRole): number {
     const envMinutes = Number(process.env.SESSION_TTL_MINUTES);
     if (Number.isFinite(envMinutes) && envMinutes >= 5 && envMinutes <= 1440) {

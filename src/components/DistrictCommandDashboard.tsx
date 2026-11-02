@@ -19,6 +19,7 @@ import {
   Search,
   Trash2,
   UserCheck,
+  Users,
   Volume2,
   VolumeX,
 } from 'lucide-react';
@@ -38,6 +39,12 @@ import {
   CareSummaryResult,
   fetchCareSummaryWithFallback,
 } from '../utils/clinicalSummaryClient';
+import {
+  AshaWorkerRosterEntry,
+  broadcastLocalRealtimeEvent,
+  loadEncryptedDistrictRelay,
+  setWorkerVerifiedInDistrictRelay,
+} from '../utils/realtimeSync';
 import {safeReadJson} from '../utils/safeFetchJson';
 import {DmoNavTab} from './TopRoleToolbar';
 
@@ -74,6 +81,7 @@ interface DistrictCommandDashboardProps {
   dmoDisplayName?: string;
   sessionToken: string;
   records: TriageRecord[];
+  ashaWorkers?: AshaWorkerRosterEntry[];
   isLoadingRecords?: boolean;
   activeTab: DmoNavTab;
   onSelectTab: (tab: DmoNavTab) => void;
@@ -83,6 +91,7 @@ interface DistrictCommandDashboardProps {
   onToggleMuteSiren: () => void;
   onDispatchAmbulance: (recordId: string) => void;
   onDeleteRecord?: (recordId: string) => Promise<void> | void;
+  onWorkerApproved?: (worker: AshaWorkerRosterEntry) => void;
 }
 
 function HealthStatusLabel({severity}: {severity: SeverityLevel}) {
@@ -115,6 +124,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
   dmoDisplayName,
   sessionToken,
   records = [],
+  ashaWorkers = [],
   isLoadingRecords = false,
   activeTab,
   onSelectTab,
@@ -124,6 +134,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
   onToggleMuteSiren,
   onDispatchAmbulance,
   onDeleteRecord,
+  onWorkerApproved,
 }) => {
   const safeRecords = Array.isArray(records) ? records : [];
   const [selectedVillage, setSelectedVillage] = useState<string>('ALL');
@@ -140,70 +151,252 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
   const [briefsByRecord, setBriefsByRecord] = useState<Record<string, ClinicalBriefResult>>({});
   const [briefErrorByRecord, setBriefErrorByRecord] = useState<Record<string, string>>({});
 
-  // Real SMS Gateway status, audit logs, and pending ASHA verifications from SQLite
+  // Real SMS Gateway status, audit logs, and connected ASHA worker directory
   const [smsGateway, setSmsGateway] = useState<SmsGatewayInfo | null>(null);
   const [smsLogs, setSmsLogs] = useState<SmsLogItem[]>([]);
+  const [serverWorkers, setServerWorkers] = useState<AshaWorkerRosterEntry[]>([]);
+  const [relayWorkers, setRelayWorkers] = useState<AshaWorkerRosterEntry[]>([]);
   const [pendingAshaUsers, setPendingAshaUsers] = useState<PendingAshaUserItem[]>([]);
   const [approvingAshaId, setApprovingAshaId] = useState<string | null>(null);
   const [confirmEraseId, setConfirmEraseId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION') return;
     let cancelled = false;
-    Promise.all([
-      fetch('/api/sms/logs', {
-        headers: {Authorization: `Bearer ${sessionToken}`},
-      }).catch((err) => {
-        console.warn('[SwasthyaSetu DMO] /api/sms/logs unavailable:', err);
-        return null;
-      }),
-      fetch('/api/auth/asha/pending', {
-        headers: {Authorization: `Bearer ${sessionToken}`},
-      }).catch((err) => {
-        console.warn('[SwasthyaSetu DMO] /api/auth/asha/pending unavailable:', err);
-        return null;
-      }),
-    ])
-      .then(async ([smsRes, pendingRes]) => {
-        if (!cancelled && smsRes?.ok) {
-          const parsedSms = await safeReadJson<{logs?: SmsLogItem[]; gateway?: SmsGatewayInfo}>(
-            smsRes
-          );
-          if (parsedSms.isJson && parsedSms.data) {
-            if (Array.isArray(parsedSms.data.logs)) setSmsLogs(parsedSms.data.logs);
-            if (parsedSms.data.gateway) setSmsGateway(parsedSms.data.gateway);
-          }
-        }
-        if (!cancelled && pendingRes?.ok) {
-          const parsedPending = await safeReadJson<{pending?: PendingAshaUserItem[]}>(pendingRes);
-          if (parsedPending.isJson && Array.isArray(parsedPending.data?.pending)) {
-            setPendingAshaUsers(parsedPending.data.pending);
-          }
+    loadEncryptedDistrictRelay()
+      .then((relay) => {
+        if (!cancelled && Array.isArray(relay.workers)) {
+          setRelayWorkers(relay.workers);
         }
       })
       .catch(() => {});
+
+    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION') {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const fetchDmoResources = () => {
+      Promise.all([
+        fetch('/api/sms/logs', {
+          headers: {Authorization: `Bearer ${sessionToken}`},
+        }).catch((err) => {
+          console.warn('[SwasthyaSetu DMO] /api/sms/logs unavailable:', err);
+          return null;
+        }),
+        fetch('/api/auth/asha/workers', {
+          headers: {Authorization: `Bearer ${sessionToken}`},
+        }).catch((err) => {
+          console.warn('[SwasthyaSetu DMO] /api/auth/asha/workers unavailable:', err);
+          return null;
+        }),
+        fetch('/api/auth/asha/pending', {
+          headers: {Authorization: `Bearer ${sessionToken}`},
+        }).catch((err) => {
+          console.warn('[SwasthyaSetu DMO] /api/auth/asha/pending unavailable:', err);
+          return null;
+        }),
+      ])
+        .then(async ([smsRes, workersRes, pendingRes]) => {
+          if (!cancelled && smsRes?.ok) {
+            const parsedSms = await safeReadJson<{logs?: SmsLogItem[]; gateway?: SmsGatewayInfo}>(
+              smsRes
+            );
+            if (parsedSms.isJson && parsedSms.data) {
+              if (Array.isArray(parsedSms.data.logs)) setSmsLogs(parsedSms.data.logs);
+              if (parsedSms.data.gateway) setSmsGateway(parsedSms.data.gateway);
+            }
+          }
+          if (!cancelled && workersRes?.ok) {
+            const parsedWorkers = await safeReadJson<{
+              workers?: AshaWorkerRosterEntry[];
+              pending?: PendingAshaUserItem[];
+            }>(workersRes);
+            if (parsedWorkers.isJson && parsedWorkers.data) {
+              if (Array.isArray(parsedWorkers.data.workers)) {
+                setServerWorkers(parsedWorkers.data.workers);
+              }
+              if (Array.isArray(parsedWorkers.data.pending)) {
+                setPendingAshaUsers(parsedWorkers.data.pending);
+              }
+            }
+          } else if (!cancelled && pendingRes?.ok) {
+            const parsedPending = await safeReadJson<{pending?: PendingAshaUserItem[]}>(pendingRes);
+            if (parsedPending.isJson && Array.isArray(parsedPending.data?.pending)) {
+              setPendingAshaUsers(parsedPending.data.pending);
+            }
+          }
+        })
+        .catch(() => {});
+    };
+
+    fetchDmoResources();
+    const pollTimer = window.setInterval(fetchDmoResources, 12_000);
     return () => {
       cancelled = true;
+      window.clearInterval(pollTimer);
     };
-  }, [sessionToken, safeRecords.length]);
+  }, [sessionToken, safeRecords.length, ashaWorkers.length]);
+
+  const combinedAshaWorkers = useMemo(() => {
+    const byId = new Map<
+      string,
+      AshaWorkerRosterEntry & {checkupCount: number; urgentCount: number; lastTimestamp?: string}
+    >();
+
+    const upsertWorker = (w: Partial<AshaWorkerRosterEntry> & {identifier: string}) => {
+      const normId = String(w.identifier || '').trim().toUpperCase();
+      if (!normId) return;
+      const prev = byId.get(normId);
+      byId.set(normId, {
+        id: w.id || prev?.id || `asha-${normId}`,
+        identifier: normId,
+        displayName: w.displayName || prev?.displayName || normId,
+        villageCode: w.villageCode || prev?.villageCode || 'VIL-204',
+        isVerified:
+          typeof w.isVerified === 'boolean'
+            ? Boolean(w.isVerified || prev?.isVerified)
+            : prev?.isVerified ?? true,
+        verifiedBy: w.verifiedBy ?? prev?.verifiedBy ?? null,
+        verifiedAtMs: w.verifiedAtMs ?? prev?.verifiedAtMs ?? null,
+        createdAtMs: w.createdAtMs || prev?.createdAtMs || Date.now(),
+        lastActiveAtMs: Math.max(w.lastActiveAtMs || 0, prev?.lastActiveAtMs || 0),
+        checkupCount: prev?.checkupCount || 0,
+        urgentCount: prev?.urgentCount || 0,
+        lastTimestamp: prev?.lastTimestamp,
+      });
+    };
+
+    for (const w of relayWorkers || []) {
+      if (w?.identifier) upsertWorker(w);
+    }
+    for (const w of ashaWorkers || []) {
+      if (w?.identifier) upsertWorker(w);
+    }
+    for (const p of pendingAshaUsers || []) {
+      if (p?.identifier) {
+        upsertWorker({
+          id: p.id,
+          identifier: p.identifier,
+          displayName: p.displayName,
+          villageCode: p.villageCode,
+          isVerified: false,
+          createdAtMs: p.createdAtMs,
+        });
+      }
+    }
+    for (const w of serverWorkers || []) {
+      if (w?.identifier) {
+        const normId = w.identifier.trim().toUpperCase();
+        const prev = byId.get(normId);
+        byId.set(normId, {
+          id: w.id,
+          identifier: normId,
+          displayName: w.displayName || prev?.displayName || normId,
+          villageCode: w.villageCode || prev?.villageCode || 'VIL-204',
+          isVerified: w.isVerified,
+          verifiedBy: w.verifiedBy ?? prev?.verifiedBy ?? null,
+          verifiedAtMs: w.verifiedAtMs ?? prev?.verifiedAtMs ?? null,
+          createdAtMs: w.createdAtMs || prev?.createdAtMs || Date.now(),
+          lastActiveAtMs: Math.max(w.lastActiveAtMs || 0, prev?.lastActiveAtMs || 0),
+          checkupCount: prev?.checkupCount || 0,
+          urgentCount: prev?.urgentCount || 0,
+          lastTimestamp: prev?.lastTimestamp,
+        });
+      }
+    }
+
+    // Also discover ASHA workers directly from submitted triage records
+    for (const rec of safeRecords) {
+      if (!rec?.ashaWorker) continue;
+      const match = /^(.+?)\s*\(([^)]+)\)\s*$/.exec(String(rec.ashaWorker).trim());
+      const extractedId = (match ? match[2] : rec.ashaWorker).trim().toUpperCase();
+      const extractedName = (match ? match[1] : rec.ashaWorker).trim();
+      if (!extractedId) continue;
+
+      if (!byId.has(extractedId)) {
+        upsertWorker({
+          identifier: extractedId,
+          displayName: extractedName,
+          villageCode: rec.villageCode || 'VIL-204',
+          isVerified: true,
+          createdAtMs: Number(rec.createdAtMs) || Date.now(),
+          lastActiveAtMs: Number(rec.createdAtMs) || Date.now(),
+        });
+      }
+      const entry = byId.get(extractedId);
+      if (entry) {
+        entry.checkupCount += 1;
+        if (rec.severity === 'emergency') {
+          entry.urgentCount += 1;
+        }
+        if ((Number(rec.createdAtMs) || 0) >= (entry.lastActiveAtMs || 0)) {
+          entry.lastActiveAtMs = Number(rec.createdAtMs) || entry.lastActiveAtMs;
+          entry.lastTimestamp = rec.timestamp;
+        }
+      }
+    }
+
+    return Array.from(byId.values()).sort((a, b) => {
+      if (a.isVerified !== b.isVerified) return a.isVerified ? 1 : -1;
+      if (b.checkupCount !== a.checkupCount) return b.checkupCount - a.checkupCount;
+      return (b.createdAtMs || 0) - (a.createdAtMs || 0);
+    });
+  }, [relayWorkers, ashaWorkers, pendingAshaUsers, serverWorkers, safeRecords]);
+
+  const effectivePendingWorkers = useMemo(
+    () => combinedAshaWorkers.filter((w) => !w.isVerified),
+    [combinedAshaWorkers]
+  );
 
   const handleApproveAshaWorker = async (identifier: string) => {
-    if (!sessionToken || sessionToken === 'OFFLINE_LOCAL_SESSION') return;
-    setApprovingAshaId(identifier);
+    if (!sessionToken) return;
+    const normId = identifier.trim().toUpperCase();
+    setApprovingAshaId(normId);
     try {
-      const resp = await fetch(`/api/auth/asha/${encodeURIComponent(identifier)}/verify`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${sessionToken}`,
-        },
-        body: JSON.stringify({verified: true}),
-      });
-      if (resp.ok) {
-        setPendingAshaUsers((prev) => prev.filter((u) => u.identifier !== identifier));
+      const relayApproved = await setWorkerVerifiedInDistrictRelay(
+        normId,
+        true,
+        dmoEmail || 'DMO_DASHBOARD'
+      );
+      if (relayApproved) {
+        setRelayWorkers((prev) => [
+          relayApproved,
+          ...prev.filter((w) => w.identifier.toUpperCase() !== normId),
+        ]);
+        broadcastLocalRealtimeEvent({
+          type: 'asha:roster_updated',
+          worker: relayApproved,
+        });
+        onWorkerApproved?.(relayApproved);
+      }
+
+      if (sessionToken !== 'OFFLINE_LOCAL_SESSION') {
+        const resp = await fetch(`/api/auth/asha/${encodeURIComponent(normId)}/verify`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({verified: true}),
+        });
+        if (resp.ok) {
+          setPendingAshaUsers((prev) =>
+            prev.filter((u) => u.identifier.toUpperCase() !== normId)
+          );
+          setServerWorkers((prev) =>
+            prev.map((w) =>
+              w.identifier.toUpperCase() === normId ? {...w, isVerified: true} : w
+            )
+          );
+        }
+      } else {
+        setPendingAshaUsers((prev) =>
+          prev.filter((u) => u.identifier.toUpperCase() !== normId)
+        );
       }
     } catch {
-      // Ignore transient network errors
+      // Ignore transient network errors; local District Relay approval already persisted
     } finally {
       setApprovingAshaId(null);
     }
@@ -705,11 +898,20 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5">
-          <p className="text-xs font-medium text-slate-600">Waiting to Sync</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-slate-600">Connected ASHA Workers</p>
+            <Users className="h-4 w-4 shrink-0 text-teal-700" />
+          </div>
           <p className="mt-1.5 text-2xl font-bold text-slate-900 tabular-nums">
-            {pendingOfflineSyncs}
+            {combinedAshaWorkers.filter((w) => w.isVerified).length}
           </p>
-          <p className="mt-1 text-xs text-slate-500">Offline field checkups</p>
+          <p className="mt-1 text-xs text-slate-500">
+            {effectivePendingWorkers.length > 0
+              ? `${effectivePendingWorkers.length} pending verification`
+              : pendingOfflineSyncs > 0
+              ? `${pendingOfflineSyncs} checkups queued`
+              : 'Synced with field clinics'}
+          </p>
         </div>
       </div>
 
@@ -727,21 +929,21 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
       </div>
 
       {/* Pending ASHA Health Worker Verification Queue (Shown when unverified registrations exist) */}
-      {pendingAshaUsers.length > 0 && (
+      {effectivePendingWorkers.length > 0 && (
         <section className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4 sm:p-5 space-y-3">
           <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="text-sm font-bold text-slate-900">
-                Pending Health Worker Verifications ({pendingAshaUsers.length})
+                Pending Health Worker Verifications ({effectivePendingWorkers.length})
               </h2>
               <p className="text-xs text-slate-600">
-                Approve verified ASHA clinic workers before their triage records or emergency alerts
-                can enter the hospital dashboard.
+                Approve verified ASHA clinic workers to connect their triage checkups and emergency
+                alerts directly to this dashboard.
               </p>
             </div>
           </div>
           <div className="divide-y divide-amber-200/70">
-            {pendingAshaUsers.map((worker) => (
+            {effectivePendingWorkers.map((worker) => (
               <div
                 key={worker.id}
                 className="flex flex-wrap items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0 text-xs"
@@ -759,7 +961,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
                 >
                   <UserCheck className="h-3.5 w-3.5" />
                   <span>
-                    {approvingAshaId === worker.identifier ? 'Approving...' : 'Approve ASHA'}
+                    {approvingAshaId === worker.identifier ? 'Approving...' : 'Approve & Connect'}
                   </span>
                 </button>
               </div>
@@ -1106,7 +1308,6 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
                               View SMS
                             </button>
                             {onDeleteRecord &&
-                              sessionToken !== 'OFFLINE_LOCAL_SESSION' &&
                               (confirmEraseId === rec.id ? (
                                 <button
                                   type="button"
@@ -1315,10 +1516,112 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
         </div>
       )}
 
+      {/* VIEW 4: CONNECTED ASHA HEALTH WORKERS DIRECTORY */}
+      {activeTab === 'workers' && (
+        <section className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6 space-y-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-base font-bold text-slate-900">
+                ASHA Health Workers ({combinedAshaWorkers.length})
+              </h2>
+              <p className="text-xs text-slate-600">
+                Review connected community health workers, approve new clinic enrollments, or filter
+                submitted patient checkups by worker.
+              </p>
+            </div>
+          </div>
+
+          {combinedAshaWorkers.length === 0 ? (
+            <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50/70 px-6 py-12 text-center">
+              <Users className="h-8 w-8 text-slate-400" />
+              <h3 className="mt-2.5 text-sm font-semibold text-slate-900">
+                No ASHA health workers registered yet
+              </h3>
+              <p className="mt-1 max-w-sm text-xs text-slate-600">
+                Once community health workers create an ASHA account or submit field checkups, their
+                clinic assignment and checkups connect here automatically.
+              </p>
+            </div>
+          ) : (
+            <div className="divide-y divide-slate-200">
+              {combinedAshaWorkers.map((worker) => {
+                const clinic = SUB_CENTER_DIRECTORY.find((c) => c.code === worker.villageCode);
+                return (
+                  <div
+                    key={worker.id}
+                    className="flex flex-col gap-3 py-4 first:pt-1 last:pb-1 sm:flex-row sm:items-center sm:justify-between"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-bold text-slate-900">
+                          {worker.displayName}
+                        </span>
+                        <span className="font-mono text-xs text-slate-600">
+                          ({worker.identifier})
+                        </span>
+                        {worker.isVerified ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                            <span>Connected</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-800">
+                            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                            <span>Pending Approval</span>
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-600 tabular-nums">
+                        {clinic ? clinic.name : 'Rural Sub-Center'} ({worker.villageCode}) ·{' '}
+                        {worker.checkupCount} checkups submitted
+                        {worker.urgentCount > 0 ? ` · ${worker.urgentCount} urgent` : ''}
+                        {worker.lastTimestamp ? ` · Last checkup ${worker.lastTimestamp}` : ''}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {!worker.isVerified && (
+                        <button
+                          type="button"
+                          disabled={approvingAshaId === worker.identifier}
+                          onClick={() => handleApproveAshaWorker(worker.identifier)}
+                          className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-teal-700 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
+                        >
+                          <UserCheck className="h-3.5 w-3.5" />
+                          <span>
+                            {approvingAshaId === worker.identifier
+                              ? 'Approving...'
+                              : 'Approve & Connect'}
+                          </span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedVillage('ALL');
+                          setStatusFilter('ALL');
+                          setSearchQuery(worker.identifier);
+                          onSelectTab('records');
+                        }}
+                        className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-50 cursor-pointer"
+                      >
+                        <ClipboardList className="h-3.5 w-3.5 text-teal-700" />
+                        <span>View Checkups ({worker.checkupCount})</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* MOBILE BOTTOM NAVIGATION BAR (< md) */}
       <nav
         aria-label="Dashboard Mobile Navigation"
-        className="fixed bottom-0 left-0 right-0 z-30 grid h-16 grid-cols-4 items-center border-t border-slate-200 bg-white/95 backdrop-blur-md pb-safe md:hidden"
+        className="fixed bottom-0 left-0 right-0 z-30 grid h-16 grid-cols-5 items-center border-t border-slate-200 bg-white/95 backdrop-blur-md pb-safe md:hidden"
       >
         <button
           type="button"
@@ -1328,7 +1631,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
           }`}
         >
           <LayoutDashboard className="h-5 w-5" />
-          <span className="text-[11px] whitespace-nowrap">Overview</span>
+          <span className="text-[10px] whitespace-nowrap">Overview</span>
         </button>
 
         <button
@@ -1339,7 +1642,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
           }`}
         >
           <AlertCircle className="h-5 w-5" />
-          <span className="text-[11px] whitespace-nowrap">
+          <span className="text-[10px] whitespace-nowrap">
             Urgent{urgentCount > 0 ? ` (${urgentCount})` : ''}
           </span>
         </button>
@@ -1352,7 +1655,20 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
           }`}
         >
           <ClipboardList className="h-5 w-5" />
-          <span className="text-[11px] whitespace-nowrap">Records</span>
+          <span className="text-[10px] whitespace-nowrap">Records</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onSelectTab('workers')}
+          className={`flex h-full flex-col items-center justify-center gap-0.5 cursor-pointer ${
+            activeTab === 'workers' ? 'text-teal-700 font-semibold' : 'text-slate-500'
+          }`}
+        >
+          <Users className="h-5 w-5" />
+          <span className="text-[10px] whitespace-nowrap">
+            ASHA{effectivePendingWorkers.length > 0 ? ` (${effectivePendingWorkers.length})` : ''}
+          </span>
         </button>
 
         <button
@@ -1363,7 +1679,7 @@ export const DistrictCommandDashboard: React.FC<DistrictCommandDashboardProps> =
           }`}
         >
           <MessageSquare className="h-5 w-5" />
-          <span className="text-[11px] whitespace-nowrap">SMS Tools</span>
+          <span className="text-[10px] whitespace-nowrap">SMS</span>
         </button>
       </nav>
     </div>

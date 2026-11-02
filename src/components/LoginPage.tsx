@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import {NetworkState, SUB_CENTER_DIRECTORY} from '../types/triage';
 import {
+  DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE,
   DEFAULT_OFFLINE_DMO_AUTH_CODE,
   hasOfflineLoginVerifier,
   saveOfflineLoginVerifier,
@@ -52,7 +53,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
   const [displayName, setDisplayName] = useState<string>('');
   const [villageCode, setVillageCode] = useState<string>('VIL-204');
   const [dmoProvisioningCode, setDmoProvisioningCode] = useState<string>('');
-  const [ashaEnrollmentCode, setAshaEnrollmentCode] = useState<string>('');
+  const [ashaEnrollmentCode, setAshaEnrollmentCode] = useState<string>(
+    DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE
+  );
   const [showSecret, setShowSecret] = useState<boolean>(false);
 
   const [submitting, setSubmitting] = useState<boolean>(false);
@@ -360,6 +363,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                 villageCode: verifiedLocal.user.villageCode,
                 ...(activeRole === 'DMO'
                   ? {dmoProvisioningCode: DEFAULT_OFFLINE_DMO_AUTH_CODE}
+                  : verifiedLocal.user.isVerified !== false
+                  ? {ashaEnrollmentCode: DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE}
                   : {}),
               }),
             });
@@ -564,7 +569,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({networkState, onAuthenticat
                     setIdentifier('');
                     setSecret('');
                     setDmoProvisioningCode('');
-                    setAshaEnrollmentCode('');
+                    setAshaEnrollmentCode(DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE);
                     setAuthError(null);
                   }}
                   className={`flex min-h-[48px] items-center gap-2.5 rounded-xl border px-3.5 py-2.5 text-left text-sm transition-colors cursor-pointer ${

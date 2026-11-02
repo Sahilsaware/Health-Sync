@@ -1,14 +1,20 @@
 import {IncentiveEntry, TriageRecord} from '../types/triage';
 import {
+  base64ToBytes,
+  bytesToBase64,
   decryptVaultData,
+  DEFAULT_OFFLINE_DMO_AUTH_CODE,
   EncryptedVaultEnvelope,
   encryptVaultData,
+  generateRandomSalt,
   isEncryptedVaultEnvelope,
 } from './cryptoVault';
 import {safeReadJson} from './safeFetchJson';
 
 export const LEGACY_SINGLETON_VAULT_KEY = 'healthsync_aes_gcm_vault_v1';
 export const SCOPED_VAULT_KEY_PREFIX = 'healthsync_aes_gcm_vault_v2_';
+export const DISTRICT_RELAY_VAULT_KEY = 'healthsync_district_relay_vault_v1';
+const DISTRICT_RELAY_IDB_SLOT = 'district_relay_v1';
 const LEGACY_PLAINTEXT_KEYS = [
   'healthsync_records',
   'healthsync_edge_v4_records',
@@ -17,6 +23,23 @@ const LEGACY_PLAINTEXT_KEYS = [
 const BROADCAST_CHANNEL_NAME = 'healthsync_edge_realtime_bus';
 const IDB_NAME = 'healthsync_encrypted_idb_v1';
 const IDB_STORE = 'encrypted_vault_envelopes';
+
+export interface AshaWorkerRosterEntry {
+  id: string;
+  identifier: string;
+  displayName: string;
+  villageCode: string;
+  isVerified: boolean;
+  verifiedBy?: string | null;
+  verifiedAtMs?: number | null;
+  createdAtMs: number;
+  lastActiveAtMs?: number;
+}
+
+export interface DistrictRelayState {
+  records: TriageRecord[];
+  workers: AshaWorkerRosterEntry[];
+}
 
 /**
  * Produces an injective, collision-free per-account vault scope identifier from (role, identifier).
@@ -94,6 +117,10 @@ export type RealtimeEventMessage =
   | {
       type: 'presence:count';
       connectedPeers: number;
+    }
+  | {
+      type: 'asha:roster_updated';
+      worker: AshaWorkerRosterEntry;
     };
 
 /**
@@ -300,6 +327,284 @@ export async function loadEncryptedRecords(
   }
 
   return fallback;
+}
+
+let cachedDistrictRelayKeyBySalt = new Map<string, CryptoKey>();
+let relayMutationQueue: Promise<DistrictRelayState> = Promise.resolve({records: [], workers: []});
+
+async function deriveDistrictRelayAesKey(salt: Uint8Array): Promise<CryptoKey> {
+  const saltB64 = bytesToBase64(salt);
+  const cached = cachedDistrictRelayKeyBySalt.get(saltB64);
+  if (cached) return cached;
+
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error('Web Crypto API unavailable for District Relay encryption.');
+  }
+  const rawMaterial = new TextEncoder().encode(
+    `healthsync-district-relay-v1|${DEFAULT_OFFLINE_DMO_AUTH_CODE}`
+  );
+  const baseKey = await subtle.importKey('raw', rawMaterial, 'PBKDF2', false, ['deriveKey']);
+  const derived = await subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt as BufferSource,
+      iterations: 100_000,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    {name: 'AES-GCM', length: 256},
+    false,
+    ['encrypt', 'decrypt']
+  );
+  cachedDistrictRelayKeyBySalt.set(saltB64, derived);
+  return derived;
+}
+
+async function readRawDistrictRelayState(): Promise<{
+  state: DistrictRelayState;
+  salt: Uint8Array | null;
+}> {
+  const empty: DistrictRelayState = {records: [], workers: []};
+  const storage = getLocalStorage();
+
+  if (storage) {
+    try {
+      const raw = storage.getItem(DISTRICT_RELAY_VAULT_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (isEncryptedVaultEnvelope(parsed)) {
+          const salt = base64ToBytes(parsed.saltB64);
+          const key = await deriveDistrictRelayAesKey(salt);
+          const dec = await decryptVaultData<DistrictRelayState>(key, parsed);
+          return {
+            state: {
+              records: Array.isArray(dec?.records) ? dec.records : [],
+              workers: Array.isArray(dec?.workers) ? dec.workers : [],
+            },
+            salt,
+          };
+        }
+      }
+    } catch {
+      // Fall through to IndexedDB or fresh salt
+    }
+  }
+
+  const idbEnv = await loadEncryptedEnvelopeFromIndexedDB(DISTRICT_RELAY_IDB_SLOT);
+  if (idbEnv) {
+    try {
+      const salt = base64ToBytes(idbEnv.saltB64);
+      const key = await deriveDistrictRelayAesKey(salt);
+      const dec = await decryptVaultData<DistrictRelayState>(key, idbEnv);
+      return {
+        state: {
+          records: Array.isArray(dec?.records) ? dec.records : [],
+          workers: Array.isArray(dec?.workers) ? dec.workers : [],
+        },
+        salt,
+      };
+    } catch {
+      return {state: empty, salt: null};
+    }
+  }
+
+  return {state: empty, salt: null};
+}
+
+async function mutateDistrictRelay(
+  mutator: (prev: DistrictRelayState) => DistrictRelayState
+): Promise<DistrictRelayState> {
+  const nextOp = relayMutationQueue
+    .catch(() => ({records: [], workers: []}))
+    .then(async () => {
+      const {state, salt: existingSalt} = await readRawDistrictRelayState();
+      const updated = mutator(state);
+      const salt = existingSalt ?? generateRandomSalt(16);
+      const key = await deriveDistrictRelayAesKey(salt);
+      const rawEnv = await encryptVaultData(key, salt, updated);
+      const env: EncryptedVaultEnvelope = {...rawEnv, kdf: 'PBKDF2-SHA256-100K'};
+      const storage = getLocalStorage();
+      if (storage) {
+        try {
+          storage.setItem(DISTRICT_RELAY_VAULT_KEY, JSON.stringify(env));
+        } catch {
+          // Ignore quota errors
+        }
+      }
+      saveEncryptedEnvelopeToIndexedDB(DISTRICT_RELAY_IDB_SLOT, env);
+      return updated;
+    });
+  relayMutationQueue = nextOp;
+  return nextOp;
+}
+
+export async function loadEncryptedDistrictRelay(): Promise<DistrictRelayState> {
+  try {
+    const {state} = await readRawDistrictRelayState();
+    return state;
+  } catch {
+    return {records: [], workers: []};
+  }
+}
+
+export async function upsertWorkerInDistrictRelay(
+  worker: Omit<AshaWorkerRosterEntry, 'id' | 'createdAtMs'> & {
+    id?: string;
+    createdAtMs?: number;
+  }
+): Promise<AshaWorkerRosterEntry | null> {
+  try {
+    const normId = String(worker.identifier || '').trim().toUpperCase();
+    if (!normId) return null;
+    const now = Date.now();
+    let savedEntry: AshaWorkerRosterEntry | null = null;
+    await mutateDistrictRelay((prev) => {
+      const existing = prev.workers.find((w) => w.identifier.toUpperCase() === normId);
+      const merged: AshaWorkerRosterEntry = {
+        id: existing?.id || worker.id || `asha-${normId}`,
+        identifier: normId,
+        displayName: worker.displayName || existing?.displayName || normId,
+        villageCode: worker.villageCode || existing?.villageCode || 'VIL-204',
+        isVerified: Boolean(worker.isVerified || existing?.isVerified),
+        verifiedBy: worker.verifiedBy ?? existing?.verifiedBy ?? null,
+        verifiedAtMs: worker.verifiedAtMs ?? existing?.verifiedAtMs ?? null,
+        createdAtMs: existing?.createdAtMs || worker.createdAtMs || now,
+        lastActiveAtMs: now,
+      };
+      savedEntry = merged;
+      const others = prev.workers.filter((w) => w.identifier.toUpperCase() !== normId);
+      return {
+        records: prev.records,
+        workers: [merged, ...others],
+      };
+    });
+    return savedEntry;
+  } catch {
+    return null;
+  }
+}
+
+export async function setWorkerVerifiedInDistrictRelay(
+  identifier: string,
+  verified: boolean,
+  verifiedBy: string
+): Promise<AshaWorkerRosterEntry | null> {
+  try {
+    const normId = String(identifier || '').trim().toUpperCase();
+    if (!normId) return null;
+    const now = Date.now();
+    let updatedEntry: AshaWorkerRosterEntry | null = null;
+    await mutateDistrictRelay((prev) => {
+      const existing = prev.workers.find((w) => w.identifier.toUpperCase() === normId);
+      const nextWorker: AshaWorkerRosterEntry = existing
+        ? {
+            ...existing,
+            isVerified: verified,
+            verifiedBy,
+            verifiedAtMs: verified ? now : null,
+            lastActiveAtMs: now,
+          }
+        : {
+            id: `asha-${normId}`,
+            identifier: normId,
+            displayName: normId,
+            villageCode: 'VIL-204',
+            isVerified: verified,
+            verifiedBy,
+            verifiedAtMs: verified ? now : null,
+            createdAtMs: now,
+            lastActiveAtMs: now,
+          };
+      updatedEntry = nextWorker;
+      const others = prev.workers.filter((w) => w.identifier.toUpperCase() !== normId);
+      return {
+        records: prev.records,
+        workers: [nextWorker, ...others],
+      };
+    });
+    return updatedEntry;
+  } catch {
+    return null;
+  }
+}
+
+export async function upsertRecordsInDistrictRelay(recordsToUpsert: TriageRecord[]): Promise<void> {
+  if (!Array.isArray(recordsToUpsert) || recordsToUpsert.length === 0) return;
+  try {
+    await mutateDistrictRelay((prev) => {
+      const byId = new Map<string, TriageRecord>();
+      for (const r of prev.records || []) {
+        if (r?.id) byId.set(r.id, r);
+      }
+      for (const r of recordsToUpsert) {
+        if (r?.id) byId.set(r.id, r);
+      }
+      const sorted = Array.from(byId.values()).sort(
+        (a, b) => (Number(b?.createdAtMs) || 0) - (Number(a?.createdAtMs) || 0)
+      );
+      return {
+        records: sorted.slice(0, 500),
+        workers: prev.workers,
+      };
+    });
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export async function dispatchRecordInDistrictRelay(
+  recordId: string,
+  ambulanceUnit = '108-AMB-UP65',
+  etaMinutes = 11
+): Promise<TriageRecord | null> {
+  if (!recordId) return null;
+  try {
+    let updatedRec: TriageRecord | null = null;
+    await mutateDistrictRelay((prev) => {
+      const nextRecords = (prev.records || []).map((rec) => {
+        if (rec?.id !== recordId) return rec;
+        const patched: TriageRecord = {
+          ...rec,
+          dispatchStatus: 'Dispatched',
+          ambulanceUnit,
+          etaMinutes,
+        };
+        updatedRec = patched;
+        return patched;
+      });
+      return {
+        records: nextRecords,
+        workers: prev.workers,
+      };
+    });
+    return updatedRec;
+  } catch {
+    return null;
+  }
+}
+
+export async function removeRecordFromDistrictRelay(recordId: string): Promise<void> {
+  if (!recordId) return;
+  try {
+    await mutateDistrictRelay((prev) => ({
+      records: (prev.records || []).filter((r) => r?.id !== recordId),
+      workers: prev.workers,
+    }));
+  } catch {
+    // Ignore
+  }
+}
+
+export function broadcastLocalRealtimeEvent(event: RealtimeEventMessage): void {
+  if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return;
+  try {
+    const channel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+    channel.postMessage(event);
+    channel.close();
+  } catch {
+    // Ignore BroadcastChannel errors
+  }
 }
 
 /**
@@ -566,10 +871,30 @@ export class HealthSyncRealtimeClient {
   public async publishRecordDispatched(
     recordId: string,
     ambulanceUnit = '108-AMB-UP65',
-    etaMinutes = 11
+    etaMinutes = 11,
+    fallbackRecord?: TriageRecord
   ): Promise<TriageRecord | null> {
+    const relayUpdated = await dispatchRecordInDistrictRelay(recordId, ambulanceUnit, etaMinutes);
+    const localPatched =
+      relayUpdated ??
+      (fallbackRecord
+        ? {
+            ...fallbackRecord,
+            dispatchStatus: 'Dispatched' as const,
+            ambulanceUnit,
+            etaMinutes,
+          }
+        : null);
+
     if (!this.sessionToken || this.sessionToken === 'OFFLINE_LOCAL_SESSION') {
-      return null;
+      if (localPatched) {
+        try {
+          this.bc?.postMessage({type: 'record:updated', record: localPatched});
+        } catch {
+          // Ignore
+        }
+      }
+      return localPatched;
     }
     try {
       const resp = await fetch(`/api/records/${encodeURIComponent(recordId)}/dispatch`, {
@@ -580,15 +905,32 @@ export class HealthSyncRealtimeClient {
         },
         body: JSON.stringify({ambulanceUnit, etaMinutes}),
       });
-      if (!resp.ok) return null;
+      if (!resp.ok) {
+        if (localPatched) {
+          try {
+            this.bc?.postMessage({type: 'record:updated', record: localPatched});
+          } catch {
+            // Ignore
+          }
+        }
+        return localPatched;
+      }
       const parsed = await safeReadJson<{record?: TriageRecord}>(resp);
       if (parsed.isJson && parsed.data?.record) {
+        void upsertRecordsInDistrictRelay([parsed.data.record]);
         this.bc?.postMessage({type: 'record:updated', record: parsed.data.record});
         return parsed.data.record;
       }
-      return null;
+      return localPatched;
     } catch {
-      return null;
+      if (localPatched) {
+        try {
+          this.bc?.postMessage({type: 'record:updated', record: localPatched});
+        } catch {
+          // Ignore
+        }
+      }
+      return localPatched;
     }
   }
 

@@ -312,6 +312,15 @@ export async function createHealthSyncServer(
     }
   };
 
+  const broadcastToDmoOfficers = (payload: unknown) => {
+    const serialized = JSON.stringify(payload);
+    for (const [client, clientUser] of clients) {
+      if (client.readyState === WebSocket.OPEN && clientUser.role === 'DMO') {
+        client.send(serialized);
+      }
+    }
+  };
+
   const disconnectSocketsForUserId = (userId: string, reason = 'Session revoked') => {
     for (const [sock, user] of Array.from(clients.entries())) {
       if (user.id === userId) {
@@ -628,6 +637,20 @@ export async function createHealthSyncServer(
         });
         await db.flushDurableWrites();
 
+        if (createdUser.role === 'ASHA') {
+          broadcastToDmoOfficers({
+            type: 'asha:roster_updated',
+            worker: {
+              id: createdUser.id,
+              identifier: createdUser.identifier,
+              displayName: createdUser.displayName,
+              villageCode: createdUser.villageCode,
+              isVerified: createdUser.isVerified,
+              createdAtMs: Date.now(),
+            },
+          });
+        }
+
         res.status(201).json(session);
       } catch (err) {
         recordAuthFailure(req);
@@ -786,11 +809,42 @@ export async function createHealthSyncServer(
       });
       await db.flushDurableWrites();
 
+      broadcastToDmoOfficers({
+        type: 'asha:roster_updated',
+        worker: {
+          id: updatedUser.id,
+          identifier: updatedUser.identifier,
+          displayName: updatedUser.displayName,
+          villageCode: updatedUser.villageCode,
+          isVerified: true,
+          createdAtMs: Date.now(),
+        },
+      });
+
       res.json({
         ok: true,
         user: updatedUser,
         token: rotated?.token,
         expiresAtMs: rotated?.expiresAtMs,
+      });
+    })
+  );
+
+  // DMO Administrative ASHA Directory & Pending Verification Queue
+  app.get(
+    '/api/auth/asha/workers',
+    requireAuth,
+    safeRoute((req: AuthedRequest, res) => {
+      if (req.authUser?.role !== 'DMO') {
+        res.status(403).json({
+          error: 'Forbidden: Only DMO officers can inspect registered ASHA workers.',
+        });
+        return;
+      }
+      const workers = db.listAshaWorkers();
+      res.json({
+        workers,
+        pending: workers.filter((w) => !w.isVerified),
       });
     })
   );
@@ -839,6 +893,17 @@ export async function createHealthSyncServer(
         rawIp: getTrustedClientIp(req),
       });
       await db.flushDurableWrites();
+      broadcastToDmoOfficers({
+        type: 'asha:roster_updated',
+        worker: {
+          id: updated.id,
+          identifier: updated.identifier,
+          displayName: updated.displayName,
+          villageCode: updated.villageCode,
+          isVerified: updated.isVerified,
+          createdAtMs: Date.now(),
+        },
+      });
       res.json({ok: true, user: updated});
     })
   );
@@ -1766,8 +1831,13 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== 'production') {
     const {createServer: createViteServer} = await import('vite');
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: {middlewareMode: true},
+      server: {
+        middlewareMode: true,
+        hmr: hmrDisabled ? false : {server: httpServer, path: '/__vite_hmr'},
+        watch: hmrDisabled ? null : {},
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

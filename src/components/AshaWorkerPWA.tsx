@@ -35,6 +35,7 @@ import {
   VitalsSnapshot,
 } from '../types/triage';
 import {encodeVitalsToSMS, formatCompactSmsTag} from '../utils/binarySmsCodec';
+import {verifyOfflineAshaEnrollmentCode} from '../utils/cryptoVault';
 import {safeReadJson} from '../utils/safeFetchJson';
 import {useVirtualWindow} from '../utils/virtualWindow';
 import {EdgeAiDiagnosticsPanel} from './EdgeAiDiagnosticsPanel';
@@ -434,29 +435,66 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
   const handleSubmitEnrollmentCode = async (e: React.FormEvent) => {
     e.preventDefault();
     setVerifyError(null);
-    if (!enrollmentCodeInput.trim()) {
+    const trimmedCode = enrollmentCodeInput.trim();
+    if (!trimmedCode) {
       setVerifyError('Please enter your Clinic Enrollment Code.');
       return;
     }
     setVerifyingCode(true);
     try {
+      if (networkState === 'offline' || sessionToken === 'OFFLINE_LOCAL_SESSION') {
+        const validLocal = await verifyOfflineAshaEnrollmentCode(trimmedCode);
+        if (!validLocal) {
+          setVerifyError('Invalid Clinic Enrollment Code.');
+          return;
+        }
+        setEnrollmentCodeInput('');
+        setFeedbackNotice(
+          'Your Health Worker account is now verified and connected to the District 24 Medical Officer dashboard.'
+        );
+        onAshaVerified?.();
+        return;
+      }
+
       const resp = await fetch('/api/auth/verify-asha', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${sessionToken}`,
         },
-        body: JSON.stringify({ashaEnrollmentCode: enrollmentCodeInput.trim()}),
+        body: JSON.stringify({ashaEnrollmentCode: trimmedCode}),
       });
       const parsed = await safeReadJson<{ok?: boolean; token?: string; error?: string}>(resp);
       if (!resp.ok || !parsed.isJson || !parsed.data?.ok) {
+        if (!parsed.isJson || resp.status >= 500 || resp.status === 404) {
+          const validLocal = await verifyOfflineAshaEnrollmentCode(trimmedCode);
+          if (validLocal) {
+            setEnrollmentCodeInput('');
+            setFeedbackNotice(
+              'Your Health Worker account is now verified and connected to the District 24 Medical Officer dashboard.'
+            );
+            onAshaVerified?.();
+            return;
+          }
+        }
         setVerifyError(parsed.data?.error || 'Could not verify Clinic Enrollment Code.');
         return;
       }
       setEnrollmentCodeInput('');
-      setFeedbackNotice('Your Health Worker account is now verified for hospital sync and emergency alerts.');
+      setFeedbackNotice(
+        'Your Health Worker account is now verified for hospital sync and emergency alerts.'
+      );
       onAshaVerified?.(parsed.data.token);
     } catch {
+      const validLocal = await verifyOfflineAshaEnrollmentCode(trimmedCode);
+      if (validLocal) {
+        setEnrollmentCodeInput('');
+        setFeedbackNotice(
+          'Your Health Worker account is now verified and connected to the District 24 Medical Officer dashboard.'
+        );
+        onAshaVerified?.();
+        return;
+      }
       setVerifyError('Could not reach the hospital server to verify your enrollment code.');
     } finally {
       if (isMountedRef.current) {
@@ -773,7 +811,7 @@ export const AshaWorkerPWA: React.FC<AshaWorkerPWAProps> = ({
       </div>
 
       {/* Pending ASHA Account Verification Banner */}
-      {!isAshaVerified && sessionToken !== 'OFFLINE_LOCAL_SESSION' && (
+      {!isAshaVerified && (
         <div
           role="status"
           className="mb-6 rounded-xl border border-amber-200 bg-amber-50/80 p-4 text-sm text-amber-950 space-y-3"

@@ -10,12 +10,21 @@ import {
 import {HealthSyncDatabase} from '../server/db';
 import {evaluateTriage, evaluateVitalStatus} from '../types/triage';
 import {
+  DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE,
   DEFAULT_OFFLINE_DMO_AUTH_CODE,
   hasOfflineLoginVerifier,
   saveOfflineLoginVerifier,
   verifyOfflineDmoAuthorizationCode,
   verifyOfflineLogin,
 } from '../utils/cryptoVault';
+import {
+  dispatchRecordInDistrictRelay,
+  DISTRICT_RELAY_VAULT_KEY,
+  loadEncryptedDistrictRelay,
+  setWorkerVerifiedInDistrictRelay,
+  upsertRecordsInDistrictRelay,
+  upsertWorkerInDistrictRelay,
+} from '../utils/realtimeSync';
 import {
   safeFetchWithFallback,
   safeParseJson,
@@ -399,6 +408,169 @@ describe('Codebase Error-Proofing & Stabilization Audit', () => {
       expect(localDmo.user.isVerified).toBe(true);
     } finally {
       if (prevDmoSecret !== undefined) process.env.DMO_PROVISIONING_SECRET = prevDmoSecret;
+      if (prevLocalStorage === undefined) {
+        delete (globalThis as {localStorage?: Storage}).localStorage;
+      } else {
+        Object.defineProperty(globalThis, 'localStorage', {
+          value: prevLocalStorage,
+          configurable: true,
+          writable: true,
+        });
+      }
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      memDb.close();
+    }
+  });
+
+  it('connects ASHA workers and triage checkups to DMO dashboard across both live server (/api/auth/asha/workers + WS) and Encrypted District Relay', async () => {
+    const prevDmoSecret = process.env.DMO_PROVISIONING_SECRET;
+    const prevAshaSecret = process.env.ASHA_ENROLLMENT_SECRET;
+    const prevLocalStorage = (globalThis as {localStorage?: Storage}).localStorage;
+    delete process.env.DMO_PROVISIONING_SECRET;
+    delete process.env.ASHA_ENROLLMENT_SECRET;
+
+    const mockLocal = new MemoryStorage();
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: mockLocal,
+      configurable: true,
+      writable: true,
+    });
+
+    const {WebSocket: WsClient} = await import('ws');
+    const memDb = new HealthSyncDatabase(':memory:', 'dmo-asha-connect-test-key-32-chars!!');
+    const {httpServer} = await createHealthSyncServer(memDb);
+    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
+    const port = (httpServer.address() as AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const wsUrl = `ws://127.0.0.1:${port}/ws/triage`;
+
+    try {
+      // 1. Register DMO officer and open authenticated WebSocket
+      const dmoReg = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          identifier: 'dmo.command@district.gov.in',
+          secret: 'CommandSafe#2026',
+          role: 'DMO',
+          displayName: 'Dr. Meera Nair',
+          villageCode: 'VIL-204',
+          dmoProvisioningCode: DEFAULT_OFFLINE_DMO_AUTH_CODE,
+        }),
+      });
+      expect(dmoReg.status).toBe(201);
+      const {token: dmoToken} = (await dmoReg.json()) as {token: string};
+
+      const receivedRosterUpdates: Array<{identifier: string; isVerified: boolean}> = [];
+      const dmoWs = new WsClient(wsUrl);
+      await new Promise<void>((resolve) => {
+        dmoWs.on('open', () => {
+          dmoWs.send(JSON.stringify({type: 'auth', token: dmoToken}));
+        });
+        dmoWs.on('message', (raw) => {
+          const parsed = JSON.parse(String(raw)) as {
+            type?: string;
+            worker?: {identifier: string; isVerified: boolean};
+          };
+          if (parsed.type === 'sync:init') resolve();
+          if (parsed.type === 'asha:roster_updated' && parsed.worker) {
+            receivedRosterUpdates.push(parsed.worker);
+          }
+        });
+      });
+
+      // 2. Register verified ASHA worker using default Clinic Enrollment Code
+      const ashaReg = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          identifier: 'ASHA-7701',
+          secret: 'SunitaField#2026',
+          role: 'ASHA',
+          displayName: 'Sunita Devi',
+          villageCode: 'VIL-204',
+          ashaEnrollmentCode: DEFAULT_OFFLINE_ASHA_ENROLLMENT_CODE,
+        }),
+      });
+      expect(ashaReg.status).toBe(201);
+      const ashaSession = (await ashaReg.json()) as {
+        token: string;
+        user: {identifier: string; isVerified: boolean};
+      };
+      expect(ashaSession.user.isVerified).toBe(true);
+
+      // DMO worker directory immediately lists ASHA-7701 as connected & verified
+      const workersRes = await fetch(`${baseUrl}/api/auth/asha/workers`, {
+        headers: {Authorization: `Bearer ${dmoToken}`},
+      });
+      expect(workersRes.status).toBe(200);
+      const workersBody = (await workersRes.json()) as {
+        workers: Array<{identifier: string; displayName: string; isVerified: boolean}>;
+      };
+      expect(
+        workersBody.workers.some(
+          (w) => w.identifier === 'ASHA-7701' && w.displayName === 'Sunita Devi' && w.isVerified
+        )
+      ).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 40));
+      expect(
+        receivedRosterUpdates.some((w) => w.identifier === 'ASHA-7701' && w.isVerified)
+      ).toBe(true);
+      dmoWs.close();
+
+      // 3. Verify Encrypted District Relay connects same-device mobile ASHA <-> DMO in OFFLINE_LOCAL_SESSION
+      //    with ZERO plaintext PHI or worker names in localStorage!
+      await upsertWorkerInDistrictRelay({
+        identifier: 'ASHA-LOCAL-99',
+        displayName: 'Kavita Verma',
+        villageCode: 'VIL-108',
+        isVerified: false,
+      });
+      await setWorkerVerifiedInDistrictRelay('ASHA-LOCAL-99', true, 'dmo.command@district.gov.in');
+      await upsertRecordsInDistrictRelay([
+        {
+          id: 'rec-local-bridge-1',
+          patientId: 'PT9901',
+          abhaId: '91-8888-7777-6666',
+          patientName: 'Savitri Devi',
+          age: 54,
+          gender: 'F',
+          villageCode: 'VIL-108',
+          villageName: 'Khajuri Sub-Center',
+          ashaWorker: 'Kavita Verma (ASHA-LOCAL-99)',
+          vitals: {systolic: 170, diastolic: 106, spo2: 88, temperature: 101.4, heartRate: 114},
+          symptoms: ['Severe Chest Pain'],
+          severity: 'emergency',
+          clinicalNotes: 'Urgent hypoxia referral from local session',
+          channel: 'Data',
+          syncStatus: 'Queued Offline',
+          binarySmsPayload: 'HS#A9901#BP170/106#SPO288#RED',
+          timestamp: '10:30 AM',
+          createdAtMs: Date.now(),
+          dispatchStatus: 'Unassigned',
+        },
+      ]);
+
+      const rawRelayEnvelope = mockLocal.getItem(DISTRICT_RELAY_VAULT_KEY) || '';
+      expect(rawRelayEnvelope.length).toBeGreaterThan(30);
+      expect(rawRelayEnvelope).not.toContain('Savitri Devi');
+      expect(rawRelayEnvelope).not.toContain('91-8888-7777-6666');
+      expect(rawRelayEnvelope).not.toContain('Kavita Verma');
+
+      // DMO dispatches ambulance in offline/local relay -> ASHA & DMO both read updated dispatch status
+      const dispatched = await dispatchRecordInDistrictRelay('rec-local-bridge-1', '108-AMB-UP65', 11);
+      expect(dispatched?.dispatchStatus).toBe('Dispatched');
+
+      const relayLoadedByDmo = await loadEncryptedDistrictRelay();
+      expect(relayLoadedByDmo.workers.some((w) => w.identifier === 'ASHA-LOCAL-99' && w.isVerified)).toBe(true);
+      expect(relayLoadedByDmo.records.length).toBe(1);
+      expect(relayLoadedByDmo.records[0].patientName).toBe('Savitri Devi');
+      expect(relayLoadedByDmo.records[0].dispatchStatus).toBe('Dispatched');
+      expect(relayLoadedByDmo.records[0].ambulanceUnit).toBe('108-AMB-UP65');
+    } finally {
+      if (prevDmoSecret !== undefined) process.env.DMO_PROVISIONING_SECRET = prevDmoSecret;
+      if (prevAshaSecret !== undefined) process.env.ASHA_ENROLLMENT_SECRET = prevAshaSecret;
       if (prevLocalStorage === undefined) {
         delete (globalThis as {localStorage?: Storage}).localStorage;
       } else {
