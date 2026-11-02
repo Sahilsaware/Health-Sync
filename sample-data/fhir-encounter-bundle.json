@@ -1,0 +1,91 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "id": "sample-asha-visit-001",
+  "meta": {
+    "tag": [
+      { "system": "https://healthsync-edge.vercel.app/tags", "code": "synthetic-sample", "display": "Synthetic data, not a real person" }
+    ]
+  },
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:11111111-1111-4111-8111-111111111111",
+      "resource": {
+        "resourceType": "Patient",
+        "id": "patient-001",
+        "identifier": [
+          { "system": "https://healthid.ndhm.gov.in", "value": "00-0000-0000-0000" }
+        ],
+        "name": [ { "text": "Sample Patient" } ],
+        "gender": "female",
+        "birthDate": "1999-04-12",
+        "address": [ { "district": "Gadchiroli", "state": "Maharashtra", "country": "IN" } ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:22222222-2222-4222-8222-222222222222",
+      "resource": {
+        "resourceType": "Encounter",
+        "id": "encounter-001",
+        "status": "finished",
+        "class": { "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "HH", "display": "home health" },
+        "subject": { "reference": "Patient/patient-001" },
+        "period": { "start": "2026-10-20T10:15:00+05:30", "end": "2026-10-20T10:40:00+05:30" },
+        "reasonCode": [ { "text": "Fever and cough for 4 days" } ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:33333333-3333-4333-8333-333333333333",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-spo2",
+        "status": "final",
+        "category": [ { "coding": [ { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs" } ] } ],
+        "code": { "coding": [ { "system": "http://loinc.org", "code": "59408-5", "display": "Oxygen saturation in Arterial blood by Pulse oximetry" } ] },
+        "subject": { "reference": "Patient/patient-001" },
+        "encounter": { "reference": "Encounter/encounter-001" },
+        "effectiveDateTime": "2026-10-20T10:20:00+05:30",
+        "valueQuantity": { "value": 90, "unit": "%", "system": "http://unitsofmeasure.org", "code": "%" }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:44444444-4444-4444-8444-444444444444",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-temp",
+        "status": "final",
+        "category": [ { "coding": [ { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs" } ] } ],
+        "code": { "coding": [ { "system": "http://loinc.org", "code": "8310-5", "display": "Body temperature" } ] },
+        "subject": { "reference": "Patient/patient-001" },
+        "encounter": { "reference": "Encounter/encounter-001" },
+        "effectiveDateTime": "2026-10-20T10:22:00+05:30",
+        "valueQuantity": { "value": 39.2, "unit": "Cel", "system": "http://unitsofmeasure.org", "code": "Cel" }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:55555555-5555-4555-8555-555555555555",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-hr",
+        "status": "final",
+        "category": [ { "coding": [ { "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs" } ] } ],
+        "code": { "coding": [ { "system": "http://loinc.org", "code": "8867-4", "display": "Heart rate" } ] },
+        "subject": { "reference": "Patient/patient-001" },
+        "encounter": { "reference": "Encounter/encounter-001" },
+        "effectiveDateTime": "2026-10-20T10:23:00+05:30",
+        "valueQuantity": { "value": 112, "unit": "/min", "system": "http://unitsofmeasure.org", "code": "/min" }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:66666666-6666-4666-8666-666666666666",
+      "resource": {
+        "resourceType": "Flag",
+        "id": "flag-emergency",
+        "status": "active",
+        "code": { "text": "Triage: emergency (screening support only, clinician to confirm)" },
+        "subject": { "reference": "Patient/patient-001" },
+        "encounter": { "reference": "Encounter/encounter-001" }
+      }
+    }
+  ]
+}
